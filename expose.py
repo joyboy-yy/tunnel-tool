@@ -20,6 +20,8 @@ import re
 import time
 import os
 import shutil
+import socket
+import struct
 
 
 SERVEO_HOST = "serveo.net"
@@ -35,6 +37,74 @@ SSH_OPTS = [
     "-o", "ConnectTimeout=10",
     "-T",  # 不分配伪终端
 ]
+
+
+def run_socks_proxy_command(proxy_host: str, proxy_port: int, target_host: str, target_port: int) -> int:
+    """Minimal SOCKS5 connector for OpenSSH ProxyCommand."""
+    try:
+        sock = socket.create_connection((proxy_host, proxy_port), timeout=15)
+        sock.settimeout(None)
+        sock.sendall(b"\x05\x01\x00")
+        if sock.recv(2) != b"\x05\x00":
+            return 1
+
+        host = target_host.encode("idna")
+        req = b"\x05\x01\x00\x03" + bytes([len(host)]) + host + struct.pack(">H", target_port)
+        sock.sendall(req)
+        resp = sock.recv(10)
+        if len(resp) < 2 or resp[1] != 0:
+            return 1
+    except Exception:
+        return 1
+
+    def stdin_to_socket():
+        try:
+            while True:
+                data = sys.stdin.buffer.read(65536)
+                if not data:
+                    break
+                sock.sendall(data)
+        except Exception:
+            pass
+        finally:
+            try:
+                sock.shutdown(socket.SHUT_WR)
+            except Exception:
+                pass
+
+    def socket_to_stdout():
+        try:
+            while True:
+                data = sock.recv(65536)
+                if not data:
+                    break
+                sys.stdout.buffer.write(data)
+                sys.stdout.buffer.flush()
+        except Exception:
+            pass
+
+    t1 = threading.Thread(target=stdin_to_socket, daemon=True)
+    t2 = threading.Thread(target=socket_to_stdout, daemon=True)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    try:
+        sock.close()
+    except Exception:
+        pass
+    return 0
+
+
+def parse_socks_proxy(value: str | None):
+    if not value:
+        return None
+    if value.startswith("socks5://"):
+        value = value[len("socks5://"):]
+    if ":" not in value:
+        raise ValueError("SOCKS proxy must be host:port")
+    host, port = value.rsplit(":", 1)
+    return host, int(port)
 
 
 def check_ssh():
@@ -75,20 +145,31 @@ def parse_public_url(line: str) -> str | None:
     return None
 
 
-def run_tunnel(local_port: int, tunnel_type: str, subdomain: str = None) -> str | None:
+def run_tunnel(local_port: int, tunnel_type: str, subdomain: str = None, socks_proxy: str = None) -> str | None:
     """启动单个SSH反向隧道, 返回公网地址"""
     if tunnel_type == "http":
         remote_port = SERVEO_HTTP_PORT
     else:
         remote_port = SERVEO_TCP_PORT
 
-    if subdomain and tunnel_type == "http":
-        remote_spec = f"{subdomain}:{remote_port}:localhost:{local_port}"
-    else:
-        remote_spec = f"{remote_port}:localhost:{local_port}"
+    local_host = "127.0.0.1"
 
-    cmd = ["ssh"] + SSH_OPTS + ["-R", remote_spec, SERVEO_HOST]
-    print(f"  → ssh -R {remote_port}:localhost:{local_port} {SERVEO_HOST}")
+    if subdomain and tunnel_type == "http":
+        remote_spec = f"{subdomain}:{remote_port}:{local_host}:{local_port}"
+    else:
+        remote_spec = f"{remote_port}:{local_host}:{local_port}"
+
+    ssh_opts = list(SSH_OPTS)
+    if socks_proxy:
+        proxy_host, proxy_port = parse_socks_proxy(socks_proxy)
+        proxy_cmd = (
+            f'"{sys.executable}" "{os.path.abspath(__file__)}" '
+            f'--socks-proxy-command {proxy_host} {proxy_port} %h %p'
+        )
+        ssh_opts += ["-o", f"ProxyCommand={proxy_cmd}"]
+
+    cmd = ["ssh"] + ssh_opts + ["-R", remote_spec, SERVEO_HOST]
+    print(f"  → ssh -R {remote_port}:{local_host}:{local_port} {SERVEO_HOST}")
 
     try:
         proc = subprocess.Popen(
@@ -227,6 +308,9 @@ def main():
     parser.add_argument("-s", "--subdomain", default=None,
                         help="自定义子域名, 如 myapp → myapp.serveo.net (仅HTTP)")
 
+    parser.add_argument("--socks", default=os.environ.get("SERVEO_SOCKS_PROXY"),
+                        help="SOCKS5 proxy for SSH, for example 127.0.0.1:7897")
+
     args = parser.parse_args()
 
     if args.ports:
@@ -254,7 +338,7 @@ def main():
     results: dict[int, str] = {}
     for port, ptype in configs:
         print(f"── 暴露 localhost:{port} ──")
-        url = run_tunnel(port, ptype, subdomain)
+        url = run_tunnel(port, ptype, subdomain, args.socks)
         if url:
             results[port] = url
         time.sleep(0.5)
@@ -279,4 +363,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 6 and sys.argv[1] == "--socks-proxy-command":
+        sys.exit(run_socks_proxy_command(sys.argv[2], int(sys.argv[3]), sys.argv[4], int(sys.argv[5])))
     main()
