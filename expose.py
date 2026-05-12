@@ -40,7 +40,7 @@ SSH_OPTS = [
 def check_ssh():
     """检查SSH是否可用"""
     if shutil.which("ssh") is None:
-        print("❌ 未找到 SSH 客户端, 请安装 OpenSSH")
+        print("[X] 未找到 SSH 客户端, 请安装 OpenSSH")
         print("   Windows: 设置 → 应用 → 可选功能 → 添加 OpenSSH 客户端")
         sys.exit(1)
     return True
@@ -56,9 +56,15 @@ def find_ssh_key():
     return None
 
 
+def strip_ansi(s: str) -> str:
+    """去除 ANSI 转义码"""
+    return re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+
 def parse_public_url(line: str) -> str | None:
     """从 serveo.net 输出中提取公网地址"""
-    # HTTP: "Forwarding HTTP traffic from https://xxxx.serveo.net"
+    line = strip_ansi(line)
+    # HTTP: "Forwarding HTTP traffic from https://xxxx.serveo.net" / serveousercontent.com
     m = re.search(r"from\s+(https?://[\w.-]+)", line, re.IGNORECASE)
     if m:
         return m.group(1)
@@ -70,17 +76,12 @@ def parse_public_url(line: str) -> str | None:
 
 
 def run_tunnel(local_port: int, tunnel_type: str, subdomain: str = None) -> str | None:
-    """
-    启动单个SSH反向隧道, 返回公网地址.
-    HTTP: 获得 https://xxx.serveo.net 域名
-    TCP:  获得 serveo.net:xxxxx 地址
-    """
+    """启动单个SSH反向隧道, 返回公网地址"""
     if tunnel_type == "http":
         remote_port = SERVEO_HTTP_PORT
     else:
         remote_port = SERVEO_TCP_PORT
 
-    # 构建远程规格
     if subdomain and tunnel_type == "http":
         remote_spec = f"{subdomain}:{remote_port}:localhost:{local_port}"
     else:
@@ -99,32 +100,36 @@ def run_tunnel(local_port: int, tunnel_type: str, subdomain: str = None) -> str 
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
         )
     except FileNotFoundError:
-        print("  ❌ 找不到 ssh 命令")
+        print("  [X] 找不到 ssh 命令")
         return None
 
     result = {"url": None, "done": False}
+    collected_lines = []
 
-    # serveo 的提示信息输出在 stderr
-    def read_stderr():
-        for line in iter(proc.stderr.readline, ""):
+    def read_output(stream, label):
+        for line in iter(stream.readline, ""):
             line = line.strip()
             if line:
+                collected_lines.append(line)
                 if "Warning:" not in line and "Authenticated" not in line:
-                    print(f"     {line}")
+                    print(f"     {strip_ansi(line)}")
                 url = parse_public_url(line)
                 if url:
                     result["url"] = url
                     result["done"] = True
-                    print(f"\n  ✅ 公网地址: {url}\n")
+                    print(f"\n  [OK] 公网地址: {url}\n")
 
-    t = threading.Thread(target=read_stderr, daemon=True)
-    t.start()
+    # 同时读取 stdout 和 stderr (新版SSH可能输出到stdout)
+    t1 = threading.Thread(target=read_output, args=(proc.stderr, "stderr"), daemon=True)
+    t2 = threading.Thread(target=read_output, args=(proc.stdout, "stdout"), daemon=True)
+    t1.start()
+    t2.start()
 
     # 等待获取地址
     waited = 0
     while not result["done"] and waited < SSH_TIMEOUT:
         if proc.poll() is not None:
-            print(f"  ❌ SSH 连接失败 (退出码: {proc.returncode})")
+            print(f"  [X] SSH 连接失败 (退出码: {proc.returncode})")
             print(f"     请确认 serveo.net 是否可达, 或稍后重试")
             return None
         time.sleep(0.5)
@@ -133,8 +138,11 @@ def run_tunnel(local_port: int, tunnel_type: str, subdomain: str = None) -> str 
     if result["url"]:
         return result["url"]
     else:
-        print(f"  ⚠️  SSH已连接但未能解析公网地址")
-        print(f"     请查看上方输出, 地址可能已显示在其中")
+        print(f"  [!]  SSH已连接但未能解析公网地址")
+        if collected_lines:
+            print(f"     接收到以下输出:")
+            for ln in collected_lines:
+                print(f"       {strip_ansi(ln)}")
         return None
 
 
@@ -159,7 +167,7 @@ def interactive_mode():
     if key:
         print(f"  SSH密钥: {key}")
     else:
-        print("  ⚠️  未检测到SSH密钥")
+        print("  [!]  未检测到SSH密钥")
         print("  请先运行: ssh-keygen -t ed25519")
         print("  (serveo.net 仅支持密钥登录)")
 
